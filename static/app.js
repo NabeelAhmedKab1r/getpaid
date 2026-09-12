@@ -11,15 +11,57 @@ const STATUS_LABELS = {
   failed: "call failed",
 };
 
+const LIVE_CALL_SESSION_LIMIT = 3;
+let currentMode = "fixture";
+
 async function loadMode() {
   const res = await fetch("/api/mode");
   const data = await res.json();
+  currentMode = data.mode;
   const pill = document.getElementById("modePill");
   pill.textContent =
     data.mode === "live"
       ? "live mode — real calls will be placed"
       : "fixture mode — no real calls placed, sample results only";
   pill.classList.add(data.mode);
+
+  const runFollowUpsBtn = document.getElementById("runFollowUps");
+  if (data.mode === "live") {
+    runFollowUpsBtn.disabled = true;
+    runFollowUpsBtn.title =
+      "Disabled in live mode — automatic follow-ups have no per-call consent, so only the individual call button can place a live call.";
+  }
+
+  updateLiveBudgetDisplay();
+}
+
+function getLiveCallsThisSession() {
+  try {
+    return parseInt(sessionStorage.getItem("getpaid_live_calls") || "0", 10);
+  } catch {
+    return 0;
+  }
+}
+
+function recordLiveCallThisSession() {
+  try {
+    sessionStorage.setItem("getpaid_live_calls", String(getLiveCallsThisSession() + 1));
+  } catch {
+    /* sessionStorage unavailable — budget display just won't persist */
+  }
+  updateLiveBudgetDisplay();
+}
+
+function updateLiveBudgetDisplay() {
+  const el = document.getElementById("liveCallBudget");
+  if (!el) return;
+  if (currentMode !== "live") {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const used = getLiveCallsThisSession();
+  el.textContent = `demo calls this session: ${used}/${LIVE_CALL_SESSION_LIMIT} — limited to help preserve free credits for everyone testing this`;
 }
 
 async function loadInvoices() {
@@ -39,6 +81,12 @@ async function loadInvoices() {
     if (btn) btn.addEventListener("click", () => placeCall(inv.id));
     const del = document.getElementById(`del-${inv.id}`);
     if (del) del.addEventListener("click", () => deleteInvoice(inv.id));
+    const consentBox = document.getElementById(`consent-${inv.id}`);
+    if (consentBox && btn) {
+      consentBox.addEventListener("change", () => {
+        btn.disabled = !consentBox.checked;
+      });
+    }
   });
 }
 
@@ -61,6 +109,14 @@ function renderCard(inv) {
     ? `<div class="review-banner">⚠ Needs human review — automatic follow-up limit reached, no more calls will be placed automatically.</div>`
     : "";
 
+  const consentCheckbox =
+    currentMode === "live"
+      ? `<label class="consent-check">
+           <input type="checkbox" id="consent-${inv.id}">
+           I confirm I have permission to call this number
+         </label>`
+      : "";
+
   return `
     <div class="invoice-card">
       <div class="card-top">
@@ -77,8 +133,10 @@ function renderCard(inv) {
       ${lastAttempt ? `<div class="note"><strong>Last call:</strong> ${escapeHtml(lastAttempt.note || "")}</div>` : ""}
       ${history ? `<div class="history">${history}</div>` : ""}
 
+      ${consentCheckbox}
+
       <div class="card-actions">
-        <button id="call-${inv.id}" class="btn-primary">
+        <button id="call-${inv.id}" class="btn-primary" ${currentMode === "live" ? "disabled" : ""}>
           ${inv.status === "not_called" ? "Place first call" : "Call again"}
         </button>
         <button id="del-${inv.id}" class="btn-ghost">Remove</button>
@@ -95,10 +153,20 @@ function escapeHtml(str) {
 
 async function placeCall(invoiceId) {
   const btn = document.getElementById(`call-${invoiceId}`);
+  const consentBox = document.getElementById(`consent-${invoiceId}`);
+  const consent = currentMode === "live" && consentBox && consentBox.checked;
+
   btn.disabled = true;
   btn.textContent = "Calling…";
   try {
-    await fetch(`/api/invoices/${invoiceId}/call`, { method: "POST" });
+    const url = `/api/invoices/${invoiceId}/call${consent ? "?consent=true" : ""}`;
+    const res = await fetch(url, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      alert(body.detail || "Could not place the call.");
+      return;
+    }
+    if (currentMode === "live") recordLiveCallThisSession();
   } finally {
     await loadInvoices();
   }
@@ -138,5 +206,7 @@ document.getElementById("runFollowUps").addEventListener("click", async (e) => {
   }
 });
 
-loadMode();
-loadInvoices();
+(async () => {
+  await loadMode(); // must resolve first: renderCard() reads currentMode
+  await loadInvoices();
+})();

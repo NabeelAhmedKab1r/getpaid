@@ -15,15 +15,25 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import ratelimit
 import storage
 from calle_client import CalleClient
 from models import Invoice, CallAttempt, CallStatus, MAX_AUTO_FOLLOW_UPS
+
+DEMO_LIMIT_MESSAGE = (
+    "Demo limit reached for this session, please try again tomorrow or fork "
+    "the repo to test with your own CALL-E account."
+)
+CONSENT_REQUIRED_MESSAGE = (
+    "Consent required: confirm you have permission to call this number "
+    "before placing a live call."
+)
 
 def _seed_demo_data_if_empty() -> None:
     """On hosts with ephemeral disk (e.g. a free-tier redeploy/restart wiping
@@ -98,13 +108,31 @@ def _invoice_from_dict(d: dict) -> Invoice:
 
 
 @app.post("/api/invoices/{invoice_id}/call")
-def api_call_invoice(invoice_id: str, follow_up: bool = False):
+def api_call_invoice(
+    invoice_id: str, request: Request, follow_up: bool = False, consent: bool = False
+):
     record = storage.get_invoice(invoice_id)
     if not record:
         raise HTTPException(404, "Invoice not found")
 
     invoice = _invoice_from_dict(record)
     client = CalleClient()
+
+    if client.mode == "live":
+        # Rate limit is checked before consent: through the real UI the call
+        # button is disabled until consent is checked, so every request that
+        # actually reaches the server in normal use already has consent=true.
+        # Checking the limit first means even a raw, unconsented request
+        # (e.g. curl) counts against the same per-IP budget and 429s once
+        # exhausted, instead of always just 403ing regardless of call count.
+        ip = request.client.host if request.client else "unknown"
+        try:
+            ratelimit.check_and_record(ip)
+        except ratelimit.RateLimitExceeded:
+            raise HTTPException(429, DEMO_LIMIT_MESSAGE)
+        if not consent:
+            raise HTTPException(403, CONSENT_REQUIRED_MESSAGE)
+
     result = client.place_call(invoice, follow_up=follow_up)
 
     status = CallStatus(result["status"])
@@ -134,7 +162,7 @@ def api_call_invoice(invoice_id: str, follow_up: bool = False):
 
 
 @app.post("/api/follow-ups/run")
-def api_run_follow_ups():
+def api_run_follow_ups(request: Request):
     """Finds every invoice eligible for an automatic follow-up call and
     places one each — a promised invoice whose promised_date has passed, or
     a voicemail/no_answer invoice whose retry window has elapsed — and
@@ -142,12 +170,24 @@ def api_run_follow_ups():
     invoices are never auto-called again, and any invoice that has already
     hit MAX_AUTO_FOLLOW_UPS is excluded and flagged needs_human_review
     instead of being retried further.
+
+    In live mode this is disabled entirely: automatic follow-ups have no
+    per-invoice consent confirmation, so they never place a real call —
+    only the per-invoice "call" button (which requires consent) can.
     """
+    if CalleClient().mode == "live":
+        return {
+            "follow_ups_placed": 0,
+            "invoices": [],
+            "message": "Automatic follow-up calls are disabled in live mode — "
+            "place individual calls with consent confirmed instead.",
+        }
+
     placed = []
     for record in storage.list_invoices():
         invoice = _invoice_from_dict(record)
         if invoice.is_eligible_for_auto_follow_up():
-            result = api_call_invoice(invoice.id, follow_up=True)
+            result = api_call_invoice(invoice.id, request, follow_up=True)
             placed.append(result)
     return {"follow_ups_placed": len(placed), "invoices": placed}
 

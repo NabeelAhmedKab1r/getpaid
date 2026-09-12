@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 from fastapi.testclient import TestClient
 
+import ratelimit
 import storage
 
 
@@ -22,6 +23,15 @@ def isolated_storage(tmp_path, monkeypatch):
     real demo data and don't leak state between tests."""
     monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
     monkeypatch.setattr(storage, "DATA_FILE", tmp_path / "invoices.json")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """The rate limiter's ip -> timestamps log is module-level state shared
+    across tests (and TestClient always uses the same fake client IP), so it
+    must be cleared before every test."""
+    ratelimit.reset()
     yield
 
 
@@ -171,3 +181,79 @@ def test_follow_up_cap_sets_needs_human_review(client):
     storage.update_invoice_fields(created["id"], status="voicemail", last_attempt_at=stale)
     run_result = client.post("/api/follow-ups/run").json()
     assert run_result["follow_ups_placed"] == 0
+
+
+@pytest.fixture
+def live_mode(monkeypatch):
+    """Simulates CALLE_MODE=live without ever touching the network: patches
+    CalleClient.place_call to return a canned result, and tracks how many
+    times it was actually invoked (i.e. how many real CALL-E calls would
+    have been placed)."""
+    monkeypatch.setenv("CALLE_MODE", "live")
+    monkeypatch.setenv("CALLE_API_KEY", "test-key")
+    calls = {"count": 0}
+
+    def fake_place_call(self, invoice, follow_up=False):
+        calls["count"] += 1
+        return {
+            "status": "no_answer",
+            "promised_date": None,
+            "note": "",
+            "calle_call_id": "fake_call_id",
+            "mode": "live",
+        }
+
+    monkeypatch.setattr("calle_client.CalleClient.place_call", fake_place_call)
+    return calls
+
+
+def test_live_call_requires_consent(client, live_mode):
+    created = client.post("/api/invoices", json=SAMPLE_INVOICE).json()
+
+    resp = client.post(f"/api/invoices/{created['id']}/call")
+    assert resp.status_code == 403
+    assert "Consent required" in resp.json()["detail"]
+    assert live_mode["count"] == 0
+
+    resp = client.post(f"/api/invoices/{created['id']}/call?consent=true")
+    assert resp.status_code == 200
+    assert live_mode["count"] == 1
+
+
+def test_live_call_rate_limit_per_ip(client, live_mode):
+    created = client.post("/api/invoices", json=SAMPLE_INVOICE).json()
+
+    for _ in range(3):
+        resp = client.post(f"/api/invoices/{created['id']}/call?consent=true")
+        assert resp.status_code == 200
+
+    resp = client.post(f"/api/invoices/{created['id']}/call?consent=true")
+    assert resp.status_code == 429
+    assert "Demo limit reached" in resp.json()["detail"]
+    assert live_mode["count"] == 3
+
+
+def test_unconsented_requests_count_toward_rate_limit_without_calling_calle(client, live_mode):
+    """The rate limit is checked before consent, so even bare, unconsented
+    requests (e.g. curl) consume the same per-IP budget and eventually 429 —
+    without ever reaching CalleClient.place_call (no real call is placed no
+    matter how many unconsented requests are sent)."""
+    created = client.post("/api/invoices", json=SAMPLE_INVOICE).json()
+
+    for _ in range(3):
+        resp = client.post(f"/api/invoices/{created['id']}/call")
+        assert resp.status_code == 403
+
+    resp = client.post(f"/api/invoices/{created['id']}/call")
+    assert resp.status_code == 429
+    assert "Demo limit reached" in resp.json()["detail"]
+    assert live_mode["count"] == 0
+
+
+def test_follow_ups_disabled_in_live_mode(client, live_mode):
+    created = client.post("/api/invoices", json=SAMPLE_INVOICE).json()
+    storage.update_invoice_fields(
+        created["id"], status="promised", promised_date="2020-01-01"
+    )
+    result = client.post("/api/follow-ups/run").json()
+    assert result["follow_ups_placed"] == 0
