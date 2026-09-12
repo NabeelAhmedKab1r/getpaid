@@ -66,6 +66,34 @@ and is judged in fixture mode**, which exercises the exact same code path
 call. Fixture mode is the default for that reason — not because live mode
 wasn't built.
 
+### Safeguards on live calls
+
+If you do run this with `CALLE_MODE=live` (e.g. hosting a public demo),
+three independent safeguards in `main.py` and `ratelimit.py` bound both
+real-world impact and CALL-E credit spend, since a live call is a real
+phone call and credits are limited:
+
+- **Consent, enforced server-side**: each invoice card shows a checkbox —
+  "I confirm I have permission to call this number" — and the call button
+  stays disabled until it's checked. This isn't just UI decoration: the
+  server rejects (`403`) any live-call request without `consent=true`
+  regardless of how the request was made, so it can't be bypassed with a
+  raw HTTP request.
+- **Per-IP rate limit**: at most `MAX_LIVE_CALLS_PER_WINDOW` (1) live calls
+  per IP per rolling 24 hours (`429` once exceeded), checked *before*
+  consent so it also bounds bare, unconsented requests.
+- **Global cap**: at most `MAX_TOTAL_LIVE_CALLS` (1, overridable via env
+  var) real calls across *all* visitors combined, for the life of the
+  process — a hard backstop against draining the CALL-E account no matter
+  how many people try the demo. Once reached, every further attempt gets a
+  `503` ("Demo credits exhausted, see the video instead") and the UI
+  proactively hides the consent checkbox and disables the call button
+  everywhere, rather than waiting for a failed click.
+
+Automatic follow-ups (`POST /api/follow-ups/run`) are disabled entirely in
+live mode, since a bulk action has no way to collect per-invoice consent —
+only the individual per-card call button can ever place a live call.
+
 ## How it uses CALL-E
 
 Each call is placed via `POST /v1/calls` with a structured
@@ -96,8 +124,9 @@ banner on its card.
 ## Side effects, credentials, and cancellation
 
 - **Side effects**: in live mode, clicking "Place first call" or "Call
-  again" places one real outbound phone call immediately. "Check for
-  overdue promises" can place one call per eligible invoice.
+  again" (with consent checked) places one real outbound phone call
+  immediately, subject to the rate limit and global cap above. "Check for
+  overdue promises" is disabled entirely in live mode — see Safeguards.
 - **Credentials**: `CALLE_API_KEY` is read from the environment only, never
   logged, and never sent to the frontend (`/api/mode` only reports whether
   a key is present, not its value).
@@ -126,6 +155,7 @@ getpaid/
 ├── calle_client.py     CALL-E API wrapper (fixture + live modes)
 ├── models.py           Invoice / CallAttempt data models
 ├── storage.py           JSON-file persistence
+├── ratelimit.py         per-IP + global live-call safeguards
 ├── static/              frontend (index.html, style.css, app.js)
 ├── fixtures/            sample structured call outcomes for fixture mode
 ├── scripts/seed_demo.py  optional: seed a few sample invoices for a demo

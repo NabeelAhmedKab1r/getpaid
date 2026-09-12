@@ -215,39 +215,76 @@ def test_live_call_requires_consent(client, live_mode):
     assert "Consent required" in resp.json()["detail"]
     assert live_mode["count"] == 0
 
+
+def test_live_call_with_consent_succeeds(client, live_mode):
+    created = client.post("/api/invoices", json=SAMPLE_INVOICE).json()
+
     resp = client.post(f"/api/invoices/{created['id']}/call?consent=true")
     assert resp.status_code == 200
     assert live_mode["count"] == 1
 
 
-def test_live_call_rate_limit_per_ip(client, live_mode):
+def test_live_call_rate_limit_per_ip(client, live_mode, monkeypatch):
+    """Per-IP limit (1) blocks a second call from the same visitor. Isolated
+    from the global cap by raising it, so this test is only exercising the
+    per-IP limiter."""
+    monkeypatch.setattr(ratelimit, "MAX_TOTAL_LIVE_CALLS", 10)
     created = client.post("/api/invoices", json=SAMPLE_INVOICE).json()
 
-    for _ in range(3):
-        resp = client.post(f"/api/invoices/{created['id']}/call?consent=true")
-        assert resp.status_code == 200
+    resp = client.post(f"/api/invoices/{created['id']}/call?consent=true")
+    assert resp.status_code == 200
 
     resp = client.post(f"/api/invoices/{created['id']}/call?consent=true")
     assert resp.status_code == 429
     assert "Demo limit reached" in resp.json()["detail"]
-    assert live_mode["count"] == 3
+    assert live_mode["count"] == 1
 
 
-def test_unconsented_requests_count_toward_rate_limit_without_calling_calle(client, live_mode):
-    """The rate limit is checked before consent, so even bare, unconsented
-    requests (e.g. curl) consume the same per-IP budget and eventually 429 —
-    without ever reaching CalleClient.place_call (no real call is placed no
-    matter how many unconsented requests are sent)."""
+def test_unconsented_requests_count_toward_rate_limit_without_calling_calle(client, live_mode, monkeypatch):
+    """The rate limit is checked before consent, so even a bare, unconsented
+    request (e.g. curl) consumes the per-IP budget (now 1) — the very next
+    one 429s, without ever reaching CalleClient.place_call. Isolated from
+    the global cap by raising it."""
+    monkeypatch.setattr(ratelimit, "MAX_TOTAL_LIVE_CALLS", 10)
     created = client.post("/api/invoices", json=SAMPLE_INVOICE).json()
 
-    for _ in range(3):
-        resp = client.post(f"/api/invoices/{created['id']}/call")
-        assert resp.status_code == 403
+    resp = client.post(f"/api/invoices/{created['id']}/call")
+    assert resp.status_code == 403
 
     resp = client.post(f"/api/invoices/{created['id']}/call")
     assert resp.status_code == 429
     assert "Demo limit reached" in resp.json()["detail"]
     assert live_mode["count"] == 0
+
+
+def test_global_cap_blocks_calls_regardless_of_ip(client, live_mode, monkeypatch):
+    """Once the global cap is reached (e.g. by some other visitor), no
+    further real call can be placed from any IP — verified by pre-seeding
+    the global counter directly and confirming a fresh request is rejected
+    before ever reaching CalleClient.place_call. Isolated from the per-IP
+    limit by raising it."""
+    monkeypatch.setattr(ratelimit, "MAX_LIVE_CALLS_PER_WINDOW", 10)
+    ratelimit.check_and_record_global()  # simulate a call already placed elsewhere
+
+    created = client.post("/api/invoices", json=SAMPLE_INVOICE).json()
+    resp = client.post(f"/api/invoices/{created['id']}/call?consent=true")
+    assert resp.status_code == 503
+    assert "Demo credits exhausted" in resp.json()["detail"]
+    assert live_mode["count"] == 0
+
+
+def test_mode_reports_live_call_budget(client, live_mode):
+    resp = client.get("/api/mode").json()
+    assert resp["live_calls_placed"] == 0
+    assert resp["live_calls_max"] == 1
+    assert resp["live_calls_exhausted"] is False
+
+    created = client.post("/api/invoices", json=SAMPLE_INVOICE).json()
+    client.post(f"/api/invoices/{created['id']}/call?consent=true")
+
+    resp = client.get("/api/mode").json()
+    assert resp["live_calls_placed"] == 1
+    assert resp["live_calls_exhausted"] is True
 
 
 def test_follow_ups_disabled_in_live_mode(client, live_mode):

@@ -184,6 +184,10 @@ input:focus,select:focus{outline:2px solid var(--green);outline-offset:1px;}
   font-size:.82rem;
   font-weight:600;
 }
+.exhausted-banner{
+  display:inline-block;
+  max-width:480px;
+}
 
 .history{margin-top:10px;font-size:.8rem;color:var(--ink-soft);}
 .history-item{padding:4px 0;}

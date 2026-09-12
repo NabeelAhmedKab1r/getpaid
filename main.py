@@ -34,6 +34,7 @@ CONSENT_REQUIRED_MESSAGE = (
     "Consent required: confirm you have permission to call this number "
     "before placing a live call."
 )
+CREDITS_EXHAUSTED_MESSAGE = "Demo credits exhausted, see the video instead."
 
 def _seed_demo_data_if_empty() -> None:
     """On hosts with ephemeral disk (e.g. a free-tier redeploy/restart wiping
@@ -85,7 +86,13 @@ def index():
 @app.get("/api/mode")
 def get_mode():
     mode = os.environ.get("CALLE_MODE", "fixture")
-    return {"mode": mode, "live_ready": bool(os.environ.get("CALLE_API_KEY"))}
+    info = {"mode": mode, "live_ready": bool(os.environ.get("CALLE_API_KEY"))}
+    if mode == "live":
+        placed = ratelimit.total_calls_placed()
+        info["live_calls_placed"] = placed
+        info["live_calls_max"] = ratelimit.MAX_TOTAL_LIVE_CALLS
+        info["live_calls_exhausted"] = placed >= ratelimit.MAX_TOTAL_LIVE_CALLS
+    return info
 
 
 @app.get("/api/invoices")
@@ -119,6 +126,13 @@ def api_call_invoice(
     client = CalleClient()
 
     if client.mode == "live":
+        # Fast-fail cheap check first: once the global cap is hit, live
+        # calling is done for good — no reason to burn a per-IP rate-limit
+        # slot checking anything else. The authoritative, atomic check
+        # happens again right before the real call below.
+        if ratelimit.total_calls_placed() >= ratelimit.MAX_TOTAL_LIVE_CALLS:
+            raise HTTPException(503, CREDITS_EXHAUSTED_MESSAGE)
+
         # Rate limit is checked before consent: through the real UI the call
         # button is disabled until consent is checked, so every request that
         # actually reaches the server in normal use already has consent=true.
@@ -132,6 +146,13 @@ def api_call_invoice(
             raise HTTPException(429, DEMO_LIMIT_MESSAGE)
         if not consent:
             raise HTTPException(403, CONSENT_REQUIRED_MESSAGE)
+
+        # Authoritative gate: only increments right before a real call is
+        # actually placed, so this count always matches real credit spend.
+        try:
+            ratelimit.check_and_record_global()
+        except ratelimit.GlobalCapReached:
+            raise HTTPException(503, CREDITS_EXHAUSTED_MESSAGE)
 
     result = client.place_call(invoice, follow_up=follow_up)
 

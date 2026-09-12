@@ -11,13 +11,19 @@ const STATUS_LABELS = {
   failed: "call failed",
 };
 
-const LIVE_CALL_SESSION_LIMIT = 3;
 let currentMode = "fixture";
+let liveCallsPlaced = 0;
+let liveCallsMax = 0;
+let liveCallsExhausted = false;
 
 async function loadMode() {
   const res = await fetch("/api/mode");
   const data = await res.json();
   currentMode = data.mode;
+  liveCallsPlaced = data.live_calls_placed ?? 0;
+  liveCallsMax = data.live_calls_max ?? 0;
+  liveCallsExhausted = data.live_calls_exhausted ?? false;
+
   const pill = document.getElementById("modePill");
   pill.textContent =
     data.mode === "live"
@@ -35,33 +41,20 @@ async function loadMode() {
   updateLiveBudgetDisplay();
 }
 
-function getLiveCallsThisSession() {
-  try {
-    return parseInt(sessionStorage.getItem("getpaid_live_calls") || "0", 10);
-  } catch {
-    return 0;
-  }
-}
-
-function recordLiveCallThisSession() {
-  try {
-    sessionStorage.setItem("getpaid_live_calls", String(getLiveCallsThisSession() + 1));
-  } catch {
-    /* sessionStorage unavailable — budget display just won't persist */
-  }
-  updateLiveBudgetDisplay();
-}
-
 function updateLiveBudgetDisplay() {
-  const el = document.getElementById("liveCallBudget");
-  if (!el) return;
+  const budget = document.getElementById("liveCallBudget");
+  const exhausted = document.getElementById("creditsExhaustedBanner");
+  if (!budget || !exhausted) return;
+
   if (currentMode !== "live") {
-    el.hidden = true;
+    budget.hidden = true;
+    exhausted.hidden = true;
     return;
   }
-  el.hidden = false;
-  const used = getLiveCallsThisSession();
-  el.textContent = `demo calls this session: ${used}/${LIVE_CALL_SESSION_LIMIT} — limited to help preserve free credits for everyone testing this`;
+
+  budget.hidden = false;
+  budget.textContent = `live demo calls used: ${liveCallsPlaced}/${liveCallsMax} — kept extremely low to preserve real CALL-E credits`;
+  exhausted.hidden = !liveCallsExhausted;
 }
 
 async function loadInvoices() {
@@ -109,13 +102,15 @@ function renderCard(inv) {
     ? `<div class="review-banner">⚠ Needs human review — automatic follow-up limit reached, no more calls will be placed automatically.</div>`
     : "";
 
+  const isLive = currentMode === "live";
   const consentCheckbox =
-    currentMode === "live"
+    isLive && !liveCallsExhausted
       ? `<label class="consent-check">
            <input type="checkbox" id="consent-${inv.id}">
            I confirm I have permission to call this number
          </label>`
       : "";
+  const callDisabled = isLive; // re-enabled per-card only once consent is checked (see loadInvoices)
 
   return `
     <div class="invoice-card">
@@ -136,8 +131,12 @@ function renderCard(inv) {
       ${consentCheckbox}
 
       <div class="card-actions">
-        <button id="call-${inv.id}" class="btn-primary" ${currentMode === "live" ? "disabled" : ""}>
-          ${inv.status === "not_called" ? "Place first call" : "Call again"}
+        <button id="call-${inv.id}" class="btn-primary" ${callDisabled ? "disabled" : ""}>
+          ${isLive && liveCallsExhausted
+            ? "Demo credits exhausted"
+            : inv.status === "not_called"
+              ? "Place first call"
+              : "Call again"}
         </button>
         <button id="del-${inv.id}" class="btn-ghost">Remove</button>
       </div>
@@ -166,8 +165,10 @@ async function placeCall(invoiceId) {
       alert(body.detail || "Could not place the call.");
       return;
     }
-    if (currentMode === "live") recordLiveCallThisSession();
   } finally {
+    // Live mode's global call budget can change on every attempt (success
+    // or not), so re-fetch it before re-rendering cards.
+    if (currentMode === "live") await loadMode();
     await loadInvoices();
   }
 }
