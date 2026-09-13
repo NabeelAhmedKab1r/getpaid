@@ -159,7 +159,9 @@ input:focus,select:focus{outline:2px solid var(--green);outline-offset:1px;}
 
 .consent-check{
   display:flex;
+  flex-direction:row;
   align-items:center;
+  justify-content:flex-start;
   gap:8px;
   margin-top:12px;
   font-size:.82rem;
